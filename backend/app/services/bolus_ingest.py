@@ -24,10 +24,58 @@ DAILY_RENAME_MAP = {
 
 def _clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Trims spaces from column names while preserving original meaning.
+    Standardizes column names by trimming extra spaces.
+
+    This keeps the original scientific meaning of the column names while
+    preventing small Excel formatting issues from breaking ingestion.
     """
     df = df.copy()
     df.columns = [str(col).strip() for col in df.columns]
+    return df
+
+
+def _find_header_row(file_path: Path, sheet_name: str) -> int:
+    """
+    Finds the row index containing the actual data header.
+
+    The MagTags bolus export includes metadata rows before the real data table.
+    In the current Cow 6263 file, the real header row contains:
+        date, timestamp, pH, temperature °C, ...
+
+    This function makes ingestion more robust by searching for the row that
+    contains both 'date' and 'timestamp' instead of assuming the header is row 0.
+    """
+    preview = pd.read_excel(file_path, sheet_name=sheet_name, header=None, nrows=30)
+
+    for row_index, row in preview.iterrows():
+        values = [str(value).strip().lower() for value in row.dropna().tolist()]
+
+        if "date" in values and "timestamp" in values:
+            return int(row_index)
+
+    raise ValueError(
+        f"Could not find a valid header row in sheet '{sheet_name}'. "
+        "Expected a row containing both 'date' and 'timestamp'."
+    )
+
+
+def _read_sheet_with_detected_header(file_path: Path, sheet_name: str) -> pd.DataFrame:
+    """
+    Reads one Excel sheet after automatically detecting the real header row.
+    """
+    header_row = _find_header_row(file_path, sheet_name)
+
+    df = pd.read_excel(
+        file_path,
+        sheet_name=sheet_name,
+        header=header_row,
+    )
+
+    df = _clean_column_names(df)
+
+    # Remove fully empty rows that may appear after the data table.
+    df = df.dropna(how="all")
+
     return df
 
 
@@ -48,9 +96,7 @@ def read_bolus_excel(cow_id: str, file_path: Path) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
 
     for sheet_name in excel.sheet_names:
-        raw = pd.read_excel(file_path, sheet_name=sheet_name)
-        raw = _clean_column_names(raw)
-
+        raw = _read_sheet_with_detected_header(file_path, sheet_name)
         lower_sheet = sheet_name.lower()
 
         if "10min" in lower_sheet:
@@ -72,8 +118,6 @@ def read_bolus_excel(cow_id: str, file_path: Path) -> pd.DataFrame:
                 raise ValueError(f"Missing columns in sheet {sheet_name}: {missing}")
 
         else:
-            # Unknown sheet names are skipped in Phase 1.
-            # Later, we can log this into QC if needed.
             continue
 
         df["cow_id"] = cow_id
