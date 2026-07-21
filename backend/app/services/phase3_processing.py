@@ -16,25 +16,13 @@ def preprocess_contractions(
     output_path: Path,
     patch_offset_minutes: float = 0.0,
 ) -> pd.DataFrame:
-    """
-    Creates full-resolution preprocessed contraction data.
-
-    Adds:
-    - timestamp_raw
-    - timestamp_corrected
-    - strain_centered_file
-    - strain_orientation_corrected
-    - acc_magnitude
-    - gyro_magnitude
-    - movement_score
-    - movement_artifact_flag
-    - flat_signal_flag
-    """
     df = pd.read_csv(processed_csv_path)
+
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     df["timestamp_raw"] = df["timestamp"]
     df["timestamp_corrected"] = df["timestamp_raw"] + pd.to_timedelta(
-        patch_offset_minutes, unit="m"
+        patch_offset_minutes,
+        unit="m",
     )
 
     numeric_cols = [
@@ -58,7 +46,9 @@ def preprocess_contractions(
         df["gyro_x"] ** 2 + df["gyro_y"] ** 2 + df["gyro_z"] ** 2
     )
 
-    df["strain_centered_file"] = df["strain"] - df.groupby("source_file")["strain"].transform("median")
+    df["strain_centered_file"] = (
+        df["strain"] - df.groupby("source_file")["strain"].transform("median")
+    )
 
     orientation_rows = []
 
@@ -89,17 +79,25 @@ def preprocess_contractions(
     )
 
     sample_period = float(df["estimated_sample_period_seconds"].dropna().median())
+
     movement_window = _rolling_window_samples(sample_period, 30)
     flat_window = _rolling_window_samples(sample_period, 30)
 
     df["acc_rolling_std_30s"] = (
-        df["acc_magnitude"].rolling(movement_window, center=True, min_periods=3).std()
+        df["acc_magnitude"]
+        .rolling(movement_window, center=True, min_periods=3)
+        .std()
     )
     df["gyro_rolling_std_30s"] = (
-        df["gyro_magnitude"].rolling(movement_window, center=True, min_periods=3).std()
+        df["gyro_magnitude"]
+        .rolling(movement_window, center=True, min_periods=3)
+        .std()
     )
 
-    df["movement_score"] = df["acc_rolling_std_30s"].fillna(0) + df["gyro_rolling_std_30s"].fillna(0)
+    df["movement_score"] = (
+        df["acc_rolling_std_30s"].fillna(0)
+        + df["gyro_rolling_std_30s"].fillna(0)
+    )
 
     movement_threshold = df["movement_score"].quantile(0.90)
 
@@ -109,8 +107,11 @@ def preprocess_contractions(
     )
 
     df["strain_rolling_std_30s"] = (
-        df["strain"].rolling(flat_window, center=True, min_periods=3).std()
+        df["strain"]
+        .rolling(flat_window, center=True, min_periods=3)
+        .std()
     )
+
     df["flat_signal_flag"] = df["strain_rolling_std_30s"] < 0.05
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -124,12 +125,6 @@ def detect_contraction_events(
     preprocessed_df: pd.DataFrame,
     output_path: Path,
 ) -> pd.DataFrame:
-    """
-    Detects candidate contraction peaks.
-
-    Uses prominence-based peak detection on orientation-corrected strain.
-    These are candidate events, not confirmed contractions.
-    """
     df = preprocessed_df.copy()
     df = df.sort_values("timestamp_corrected").reset_index(drop=True)
 
@@ -157,6 +152,8 @@ def detect_contraction_events(
         width=min_width_samples,
     )
 
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
     if len(peaks) == 0:
         events = pd.DataFrame(
             columns=[
@@ -173,15 +170,13 @@ def detect_contraction_events(
                 "event_label",
             ]
         )
-        output_path.parent.mkdir(parents=True, exist_ok=True)
         events.to_csv(output_path, index=False)
         return events
 
     widths = peak_widths(signal, peaks, rel_height=0.5)[0]
+    near_peak_samples = _rolling_window_samples(sample_period, 10)
 
     rows = []
-
-    near_peak_samples = _rolling_window_samples(sample_period, 10)
 
     for event_id, peak_index in enumerate(peaks, start=1):
         left = max(0, peak_index - near_peak_samples)
@@ -215,7 +210,6 @@ def detect_contraction_events(
         )
 
     events = pd.DataFrame(rows)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     events.to_csv(output_path, index=False)
 
     return events
@@ -227,9 +221,6 @@ def create_contraction_10min_summary(
     events_df: pd.DataFrame,
     output_path: Path,
 ) -> pd.DataFrame:
-    """
-    Creates 10-minute contraction summary for synchronization with bolus data.
-    """
     df = preprocessed_df.copy()
     df["timestamp_corrected"] = pd.to_datetime(df["timestamp_corrected"], errors="coerce")
     df = df.dropna(subset=["timestamp_corrected"])
@@ -248,7 +239,11 @@ def create_contraction_10min_summary(
     )
 
     summary["strain_range"] = summary["strain_max"] - summary["strain_min"]
-    summary = summary.reset_index().rename(columns={"timestamp_corrected": "timestamp"})
+    summary["has_contraction_samples"] = summary["sample_count"] > 0
+
+    summary = summary.reset_index().rename(
+        columns={"timestamp_corrected": "timestamp"}
+    )
 
     if not events_df.empty:
         events = events_df.copy()
@@ -257,6 +252,7 @@ def create_contraction_10min_summary(
         events = events.set_index("peak_time").sort_index()
 
         event_counts = events.resample("10min").size().rename("candidate_peak_count")
+
         candidate_only = (
             events[events["event_label"] == "candidate_contraction"]
             .resample("10min")
@@ -264,14 +260,26 @@ def create_contraction_10min_summary(
             .rename("clean_candidate_peak_count")
         )
 
-        summary = summary.merge(event_counts.reset_index().rename(columns={"peak_time": "timestamp"}), on="timestamp", how="left")
-        summary = summary.merge(candidate_only.reset_index().rename(columns={"peak_time": "timestamp"}), on="timestamp", how="left")
+        summary = summary.merge(
+            event_counts.reset_index().rename(columns={"peak_time": "timestamp"}),
+            on="timestamp",
+            how="left",
+        )
+        summary = summary.merge(
+            candidate_only.reset_index().rename(columns={"peak_time": "timestamp"}),
+            on="timestamp",
+            how="left",
+        )
     else:
         summary["candidate_peak_count"] = 0
         summary["clean_candidate_peak_count"] = 0
 
-    summary["candidate_peak_count"] = summary["candidate_peak_count"].fillna(0).astype(int)
-    summary["clean_candidate_peak_count"] = summary["clean_candidate_peak_count"].fillna(0).astype(int)
+    summary["candidate_peak_count"] = (
+        summary["candidate_peak_count"].fillna(0).astype(int)
+    )
+    summary["clean_candidate_peak_count"] = (
+        summary["clean_candidate_peak_count"].fillna(0).astype(int)
+    )
 
     summary.insert(0, "cow_id", cow_id)
 
@@ -287,14 +295,13 @@ def preprocess_bolus(
     output_path: Path,
     bolus_offset_minutes: float = 0.0,
 ) -> pd.DataFrame:
-    """
-    Adds timestamp_corrected and basic rolling features for bolus records.
-    """
     df = pd.read_csv(bolus_csv_path)
+
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     df["timestamp_raw"] = df["timestamp"]
     df["timestamp_corrected"] = df["timestamp_raw"] + pd.to_timedelta(
-        bolus_offset_minutes, unit="m"
+        bolus_offset_minutes,
+        unit="m",
     )
 
     for col in [
@@ -316,23 +323,26 @@ def preprocess_bolus(
         ten["temperature_c"]
     )
 
-    ten["temp_rolling_mean_1h"] = ten["temperature_for_analysis"].rolling(
-        6, min_periods=1
-    ).mean()
-    ten["temp_rolling_mean_3h"] = ten["temperature_for_analysis"].rolling(
-        18, min_periods=1
-    ).mean()
-    ten["activity_rolling_mean_1h"] = ten["activity"].rolling(
-        6, min_periods=1
-    ).mean()
+    ten["temp_rolling_mean_1h"] = (
+        ten["temperature_for_analysis"].rolling(6, min_periods=1).mean()
+    )
+    ten["temp_rolling_mean_3h"] = (
+        ten["temperature_for_analysis"].rolling(18, min_periods=1).mean()
+    )
+    ten["activity_rolling_mean_1h"] = (
+        ten["activity"].rolling(6, min_periods=1).mean()
+    )
 
     ten["date_only"] = ten["timestamp_corrected"].dt.date
-    ten["daily_temp_median"] = ten.groupby("date_only")["temperature_for_analysis"].transform("median")
+    ten["daily_temp_median"] = ten.groupby("date_only")[
+        "temperature_for_analysis"
+    ].transform("median")
     ten["temp_deviation_from_daily_median"] = (
         ten["temperature_for_analysis"] - ten["daily_temp_median"]
     )
 
     daily = df[df["record_type"] == "daily"].copy()
+
     out = pd.concat([ten, daily], ignore_index=True, sort=False)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -345,20 +355,37 @@ def merge_bolus_and_contractions_10min(
     cow_id: str,
     bolus_preprocessed_df: pd.DataFrame,
     contraction_summary_df: pd.DataFrame,
-    output_path: Path,
-) -> pd.DataFrame:
+    all_bolus_output_path: Path,
+    overlap_output_path: Path,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Merges Cow 6263 bolus 10-minute data with contraction 10-minute summaries.
+    Creates two merged outputs:
+    1. all_bolus: full bolus timeline with contraction columns where available
+    2. overlap_only: only rows where bolus and contraction samples both exist
     """
-    bolus = bolus_preprocessed_df[bolus_preprocessed_df["record_type"] == "10min"].copy()
-    bolus["timestamp"] = pd.to_datetime(bolus["timestamp_corrected"], errors="coerce")
+    bolus = bolus_preprocessed_df[
+        bolus_preprocessed_df["record_type"] == "10min"
+    ].copy()
+
+    bolus["timestamp"] = pd.to_datetime(
+        bolus["timestamp_corrected"],
+        errors="coerce",
+    )
     bolus = bolus.dropna(subset=["timestamp"]).sort_values("timestamp")
+    bolus["has_bolus_data"] = True
 
     contractions = contraction_summary_df.copy()
-    contractions["timestamp"] = pd.to_datetime(contractions["timestamp"], errors="coerce")
+    contractions["timestamp"] = pd.to_datetime(
+        contractions["timestamp"],
+        errors="coerce",
+    )
     contractions = contractions.dropna(subset=["timestamp"]).sort_values("timestamp")
+    contractions["has_contraction_data"] = True
+    contractions["has_contraction_samples"] = (
+        contractions["sample_count"].fillna(0) > 0
+    )
 
-    merged = pd.merge_asof(
+    merged_all = pd.merge_asof(
         bolus,
         contractions,
         on="timestamp",
@@ -367,9 +394,22 @@ def merge_bolus_and_contractions_10min(
         suffixes=("_bolus", "_contractions"),
     )
 
-    merged.insert(0, "merged_cow_id", cow_id)
+    merged_all["has_contraction_data"] = (
+        merged_all["has_contraction_data"].fillna(False).astype(bool)
+    )
+    merged_all["has_contraction_samples"] = (
+        merged_all["has_contraction_samples"].fillna(False).astype(bool)
+    )
+    merged_all["is_overlap_window"] = (
+        merged_all["has_bolus_data"] & merged_all["has_contraction_samples"]
+    )
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    merged.to_csv(output_path, index=False)
+    merged_all.insert(0, "merged_cow_id", cow_id)
 
-    return merged
+    merged_overlap = merged_all[merged_all["is_overlap_window"]].copy()
+
+    all_bolus_output_path.parent.mkdir(parents=True, exist_ok=True)
+    merged_all.to_csv(all_bolus_output_path, index=False)
+    merged_overlap.to_csv(overlap_output_path, index=False)
+
+    return merged_all, merged_overlap

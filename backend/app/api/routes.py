@@ -1,3 +1,4 @@
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -5,6 +6,8 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Upload
 from fastapi.responses import FileResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+
+from app.services.visualization_service import generate_all_visualizations
 
 from app.core.config import settings
 from app.db.session import get_db
@@ -34,6 +37,90 @@ from app.services.storage import get_processed_folder, get_raw_folder, save_uplo
 router = APIRouter()
 
 
+def parse_optional_datetime(value: str | None):
+    """
+    Converts frontend datetime string into a naive Python datetime for SQLite.
+    """
+    if not value:
+        return None
+
+    cleaned = value.replace("Z", "+00:00")
+
+    try:
+        parsed = datetime.fromisoformat(cleaned)
+        return parsed.replace(tzinfo=None)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid datetime format: {value}",
+        ) from exc
+
+
+def create_or_update_cow(
+    db: Session,
+    cow_id: str,
+    calving_datetime: str | None,
+    notes: str | None,
+):
+    """
+    Creates a cow if missing, or updates calving datetime/notes if the cow exists.
+    """
+    parsed_calving = parse_optional_datetime(calving_datetime)
+
+    cow = db.get(Cow, cow_id)
+
+    if cow is None:
+        cow = Cow(
+            cow_id=cow_id,
+            calving_datetime=parsed_calving,
+            notes=notes,
+        )
+        db.add(cow)
+    else:
+        if parsed_calving is not None:
+            cow.calving_datetime = parsed_calving
+
+        if notes:
+            cow.notes = notes
+
+    db.commit()
+    db.refresh(cow)
+
+    return cow
+
+
+def ensure_data_type_not_already_uploaded(
+    db: Session,
+    cow_id: str,
+    data_type: str,
+):
+    """
+    Blocks repeated upload of the same data type for the same cow.
+
+    Example:
+    - cow 6263 contractions uploaded once -> cannot upload 6263 contractions again
+    - cow 6263 bolus uploaded once -> cannot upload 6263 bolus again
+    """
+    existing_upload = (
+        db.query(UploadBatch)
+        .filter(
+            UploadBatch.cow_id == cow_id,
+            UploadBatch.data_type == data_type,
+            UploadBatch.row_count > 0,
+        )
+        .first()
+    )
+
+    if existing_upload:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{data_type.capitalize()} data for cow {cow_id} has already been uploaded. "
+                "To re-upload, reset this cow's database records and generated files first."
+            ),
+        )
+
+
 @router.get("/health")
 def health_check():
     return {"status": "ok", "message": "Hoffmann Lab API is running"}
@@ -50,6 +137,7 @@ def list_cows(db: Session = Depends(get_db)):
             .filter(ContractionRecord.cow_id == cow.cow_id)
             .scalar()
         )
+
         bolus_count = (
             db.query(func.count(BolusRecord.id))
             .filter(BolusRecord.cow_id == cow.cow_id)
@@ -116,17 +204,35 @@ def preview_processed_data(
     data_type: str,
     n_rows: int = Query(default=50, ge=5, le=500),
 ):
-    if data_type not in {"contractions", "bolus", "contractions_preprocessed", "contraction_events", "contractions_10min_summary", "bolus_preprocessed", "merged_10min"}:
+    allowed_data_types = {
+        "contractions",
+        "bolus",
+        "contractions_timing_qc",
+        "contractions_qc",
+        "bolus_qc",
+        "contractions_preprocessed",
+        "contraction_events",
+        "contractions_10min_summary",
+        "bolus_preprocessed",
+        "merged_10min_all_bolus",
+        "merged_10min_overlap_only",
+    }
+
+    if data_type not in allowed_data_types:
         raise HTTPException(status_code=400, detail="Invalid data type.")
 
     file_map = {
         "contractions": f"cow_{cow_id}_contractions_processed.csv",
         "bolus": f"cow_{cow_id}_bolus_processed.csv",
+        "contractions_timing_qc": f"cow_{cow_id}_contractions_timing_qc.csv",
+        "contractions_qc": f"cow_{cow_id}_contractions_qc_report.csv",
+        "bolus_qc": f"cow_{cow_id}_bolus_qc_report.csv",
         "contractions_preprocessed": f"cow_{cow_id}_contractions_preprocessed.csv",
         "contraction_events": f"cow_{cow_id}_contraction_events.csv",
         "contractions_10min_summary": f"cow_{cow_id}_contractions_10min_summary.csv",
         "bolus_preprocessed": f"cow_{cow_id}_bolus_preprocessed.csv",
-        "merged_10min": f"cow_{cow_id}_merged_10min.csv",
+        "merged_10min_all_bolus": f"cow_{cow_id}_merged_10min_all_bolus.csv",
+        "merged_10min_overlap_only": f"cow_{cow_id}_merged_10min_overlap_only.csv",
     }
 
     file_path = settings.PROCESSED_DATA_DIR / f"cow_{cow_id}" / file_map[data_type]
@@ -147,6 +253,58 @@ def preview_processed_data(
     }
 
 
+@router.post("/visualizations/{cow_id}")
+def generate_visualizations(cow_id: str, db: Session = Depends(get_db)):
+    processed_folder = get_processed_folder(cow_id)
+
+    if not processed_folder.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"No processed folder found for cow {cow_id}. Run upload and Phase 3 first.",
+        )
+
+    required_file = processed_folder / f"cow_{cow_id}_contractions_preprocessed.csv"
+
+    if not required_file.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="Phase 3 preprocessed contraction file not found. Run Phase 3 first.",
+        )
+
+    try:
+        outputs = generate_all_visualizations(
+            cow_id=cow_id,
+            processed_folder=processed_folder,
+            db=db,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return {
+        "message": "Visualizations generated successfully.",
+        "cow_id": cow_id,
+        "figure_count": len(outputs),
+        "outputs": outputs,
+    }
+
+
+@router.get("/download-figure/{cow_id}/{file_name}")
+def download_figure(cow_id: str, file_name: str):
+    if "/" in file_name or "\\" in file_name:
+        raise HTTPException(status_code=400, detail="Invalid file name.")
+
+    file_path = get_processed_folder(cow_id) / "figures" / file_name
+
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Figure not found.")
+
+    return FileResponse(
+        path=file_path,
+        filename=file_path.name,
+        media_type="image/png",
+    )
+
+
 @router.post("/upload/contractions")
 async def upload_contractions(
     cow_id: str = Form(...),
@@ -156,16 +314,23 @@ async def upload_contractions(
     db: Session = Depends(get_db),
 ):
     try:
+        ensure_data_type_not_already_uploaded(
+            db=db,
+            cow_id=cow_id,
+            data_type="contractions",
+        )
+
         raw_folder = get_raw_folder(cow_id, "contractions")
         processed_folder = get_processed_folder(cow_id)
         raw_folder.mkdir(parents=True, exist_ok=True)
         processed_folder.mkdir(parents=True, exist_ok=True)
 
-        cow = db.get(Cow, cow_id)
-        if cow is None:
-            cow = Cow(cow_id=cow_id, notes=notes)
-            db.add(cow)
-            db.commit()
+        create_or_update_cow(
+            db=db,
+            cow_id=cow_id,
+            calving_datetime=calving_datetime,
+            notes=notes,
+        )
 
         saved_paths: list[Path] = []
         duplicate_files: list[str] = []
@@ -185,7 +350,10 @@ async def upload_contractions(
 
         for file in files:
             if not file.filename.lower().endswith(".txt"):
-                raise HTTPException(status_code=400, detail=f"{file.filename} is not a TXT file.")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{file.filename} is not a TXT file.",
+                )
 
             destination = raw_folder / file.filename
             saved_path = await save_upload_file(file, destination)
@@ -226,7 +394,10 @@ async def upload_contractions(
                 "duplicate_files": duplicate_files,
             }
 
-        df, timing_qc_df = combine_contraction_files(cow_id=cow_id, file_paths=saved_paths)
+        df, timing_qc_df = combine_contraction_files(
+            cow_id=cow_id,
+            file_paths=saved_paths,
+        )
 
         processed_file = processed_folder / f"cow_{cow_id}_contractions_processed.csv"
         df.to_csv(processed_file, index=False)
@@ -250,6 +421,14 @@ async def upload_contractions(
                 dataset_type="contractions_processed",
                 file_path=str(processed_file),
                 row_count=len(df),
+            )
+        )
+        db.add(
+            ProcessedDataset(
+                cow_id=cow_id,
+                dataset_type="contractions_timing_qc",
+                file_path=str(timing_qc_file),
+                row_count=len(timing_qc_df),
             )
         )
         db.add(
@@ -282,11 +461,18 @@ async def upload_contractions(
             "file_count": len(saved_paths),
             "row_count": inserted_count,
             "processed_file": str(processed_file),
+            "timing_qc_file": str(timing_qc_file),
             "qc_file": str(qc_file),
             "duplicate_files": duplicate_files,
-            "estimated_sample_period_seconds": float(df["estimated_sample_period_seconds"].median()),
+            "estimated_sample_period_summary": {
+                "min": float(df["estimated_sample_period_seconds"].min()),
+                "median": float(df["estimated_sample_period_seconds"].median()),
+                "max": float(df["estimated_sample_period_seconds"].max()),
+            },
         }
 
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -300,19 +486,29 @@ async def upload_bolus(
     db: Session = Depends(get_db),
 ):
     try:
+        ensure_data_type_not_already_uploaded(
+            db=db,
+            cow_id=cow_id,
+            data_type="bolus",
+        )
+
         if not file.filename.lower().endswith((".xlsx", ".xls")):
-            raise HTTPException(status_code=400, detail="Bolus upload must be Excel for this version.")
+            raise HTTPException(
+                status_code=400,
+                detail="Bolus upload must be Excel for this version.",
+            )
 
         raw_folder = get_raw_folder(cow_id, "bolus")
         processed_folder = get_processed_folder(cow_id)
         raw_folder.mkdir(parents=True, exist_ok=True)
         processed_folder.mkdir(parents=True, exist_ok=True)
 
-        cow = db.get(Cow, cow_id)
-        if cow is None:
-            cow = Cow(cow_id=cow_id, notes=notes)
-            db.add(cow)
-            db.commit()
+        create_or_update_cow(
+            db=db,
+            cow_id=cow_id,
+            calving_datetime=calving_datetime,
+            notes=notes,
+        )
 
         saved_path = await save_upload_file(file, raw_folder / file.filename)
         file_hash = calculate_file_sha256(saved_path)
@@ -328,11 +524,10 @@ async def upload_bolus(
         )
 
         if existing:
-            return {
-                "message": "Bolus file was already uploaded. Duplicate skipped.",
-                "cow_id": cow_id,
-                "duplicate_file": file.filename,
-            }
+            raise HTTPException(
+                status_code=409,
+                detail=f"Bolus file for cow {cow_id} has already been uploaded.",
+            )
 
         df = read_bolus_excel(cow_id=cow_id, file_path=saved_path)
 
@@ -376,6 +571,14 @@ async def upload_bolus(
                 row_count=len(df),
             )
         )
+        db.add(
+            ProcessedDataset(
+                cow_id=cow_id,
+                dataset_type="bolus_qc_report",
+                file_path=str(qc_file),
+                row_count=len(qc_df),
+            )
+        )
 
         for _, row in qc_df.iterrows():
             if pd.notna(row.get("qc_warning")):
@@ -401,6 +604,8 @@ async def upload_bolus(
             "stored_sheets": sorted(df["record_type"].dropna().unique().tolist()),
         }
 
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -418,9 +623,14 @@ def run_phase3_processing(
     bolus_csv = processed_folder / f"cow_{cow_id}_bolus_processed.csv"
 
     if not contraction_csv.exists():
-        raise HTTPException(status_code=404, detail="Contraction processed CSV not found.")
+        raise HTTPException(
+            status_code=404,
+            detail="Contraction processed CSV not found.",
+        )
 
-    contractions_preprocessed_path = processed_folder / f"cow_{cow_id}_contractions_preprocessed.csv"
+    contractions_preprocessed_path = (
+        processed_folder / f"cow_{cow_id}_contractions_preprocessed.csv"
+    )
     events_path = processed_folder / f"cow_{cow_id}_contraction_events.csv"
     summary_path = processed_folder / f"cow_{cow_id}_contractions_10min_summary.csv"
 
@@ -443,6 +653,12 @@ def run_phase3_processing(
         events_df=events_df,
         output_path=summary_path,
     )
+
+    outputs = {
+        "contractions_preprocessed": str(contractions_preprocessed_path),
+        "contraction_events": str(events_path),
+        "contractions_10min_summary": str(summary_path),
+    }
 
     db.add(
         ProcessedDataset(
@@ -484,15 +700,10 @@ def run_phase3_processing(
             )
         )
 
-    outputs = {
-        "contractions_preprocessed": str(contractions_preprocessed_path),
-        "contraction_events": str(events_path),
-        "contractions_10min_summary": str(summary_path),
-    }
-
     if bolus_csv.exists():
         bolus_preprocessed_path = processed_folder / f"cow_{cow_id}_bolus_preprocessed.csv"
-        merged_path = processed_folder / f"cow_{cow_id}_merged_10min.csv"
+        merged_all_path = processed_folder / f"cow_{cow_id}_merged_10min_all_bolus.csv"
+        merged_overlap_path = processed_folder / f"cow_{cow_id}_merged_10min_overlap_only.csv"
 
         bolus_df = preprocess_bolus(
             cow_id=cow_id,
@@ -501,11 +712,12 @@ def run_phase3_processing(
             bolus_offset_minutes=bolus_offset_minutes,
         )
 
-        merged_df = merge_bolus_and_contractions_10min(
+        merged_all_df, merged_overlap_df = merge_bolus_and_contractions_10min(
             cow_id=cow_id,
             bolus_preprocessed_df=bolus_df,
             contraction_summary_df=summary_df,
-            output_path=merged_path,
+            all_bolus_output_path=merged_all_path,
+            overlap_output_path=merged_overlap_path,
         )
 
         db.add(
@@ -519,14 +731,23 @@ def run_phase3_processing(
         db.add(
             ProcessedDataset(
                 cow_id=cow_id,
-                dataset_type="merged_10min",
-                file_path=str(merged_path),
-                row_count=len(merged_df),
+                dataset_type="merged_10min_all_bolus",
+                file_path=str(merged_all_path),
+                row_count=len(merged_all_df),
+            )
+        )
+        db.add(
+            ProcessedDataset(
+                cow_id=cow_id,
+                dataset_type="merged_10min_overlap_only",
+                file_path=str(merged_overlap_path),
+                row_count=len(merged_overlap_df),
             )
         )
 
         outputs["bolus_preprocessed"] = str(bolus_preprocessed_path)
-        outputs["merged_10min"] = str(merged_path)
+        outputs["merged_10min_all_bolus"] = str(merged_all_path)
+        outputs["merged_10min_overlap_only"] = str(merged_overlap_path)
 
     db.commit()
 
@@ -566,24 +787,33 @@ def export_clocklab_files(cow_id: str):
         )
 
     if summary_10min.exists():
-        outputs["contraction_strain_10min"] = export_clocklab_csv_and_awd(
-            input_csv_path=summary_10min,
-            output_folder=clocklab_folder,
-            output_stem=f"cow_{cow_id}_contraction_strain_10min_clocklab",
-            timestamp_col="timestamp",
-            value_col="strain_mean",
+        outputs["contraction_strain_10min_sampled_only"] = (
+            export_clocklab_csv_and_awd(
+                input_csv_path=summary_10min,
+                output_folder=clocklab_folder,
+                output_stem=f"cow_{cow_id}_contraction_strain_10min_sampled_only_clocklab",
+                timestamp_col="timestamp",
+                value_col="strain_mean",
+                require_sample_data_col="has_contraction_samples",
+            )
         )
 
-        outputs["contraction_peak_count_10min"] = export_clocklab_csv_and_awd(
-            input_csv_path=summary_10min,
-            output_folder=clocklab_folder,
-            output_stem=f"cow_{cow_id}_contraction_peak_count_10min_clocklab",
-            timestamp_col="timestamp",
-            value_col="candidate_peak_count",
+        outputs["contraction_peak_count_10min_sampled_only"] = (
+            export_clocklab_csv_and_awd(
+                input_csv_path=summary_10min,
+                output_folder=clocklab_folder,
+                output_stem=f"cow_{cow_id}_contraction_peak_count_10min_sampled_only_clocklab",
+                timestamp_col="timestamp",
+                value_col="candidate_peak_count",
+                require_sample_data_col="has_contraction_samples",
+            )
         )
 
     if not outputs:
-        raise HTTPException(status_code=404, detail="No Phase 3 files found for ClockLab export.")
+        raise HTTPException(
+            status_code=404,
+            detail="No Phase 3 files found for ClockLab export.",
+        )
 
     return {
         "message": "ClockLab CSV and AWD files created.",
@@ -592,18 +822,172 @@ def export_clocklab_files(cow_id: str):
     }
 
 
+@router.get("/files/{cow_id}")
+def list_generated_files(cow_id: str):
+    processed_folder = get_processed_folder(cow_id)
+
+    if not processed_folder.exists():
+        return {"cow_id": cow_id, "files": []}
+
+    file_descriptions = {
+        "contractions_processed": {
+            "file_name": f"cow_{cow_id}_contractions_processed.csv",
+            "phase": "Phase 1 / Phase 2",
+            "description": "Corrected full-resolution contraction data with timestamps, file metadata, and raw sensor columns.",
+            "download_key": "contractions",
+        },
+        "contractions_timing_qc": {
+            "file_name": f"cow_{cow_id}_contractions_timing_qc.csv",
+            "phase": "Phase 2",
+            "description": "File-level timing QC showing row counts, sample-period estimates, natural end times, gaps, and recording segments.",
+            "download_key": "contractions_timing_qc",
+        },
+        "contractions_qc": {
+            "file_name": f"cow_{cow_id}_contractions_qc_report.csv",
+            "phase": "Phase 2",
+            "description": "Signal QC report flagging partial files, flat/stuck strain, missing values, and movement flag issues.",
+            "download_key": "contractions_qc",
+        },
+        "bolus_processed": {
+            "file_name": f"cow_{cow_id}_bolus_processed.csv",
+            "phase": "Phase 1 / Phase 2",
+            "description": "Cleaned bolus Excel data including 10-minute records and daily records.",
+            "download_key": "bolus",
+        },
+        "bolus_qc": {
+            "file_name": f"cow_{cow_id}_bolus_qc_report.csv",
+            "phase": "Phase 2",
+            "description": "Bolus QC report checking timestamps, 10-minute spacing, duplicates, and missing temperature values.",
+            "download_key": "bolus_qc",
+        },
+        "contractions_preprocessed": {
+            "file_name": f"cow_{cow_id}_contractions_preprocessed.csv",
+            "phase": "Phase 3",
+            "description": "Full-resolution contraction data with baseline correction, orientation correction, movement score, and flat-signal flags.",
+            "download_key": "contractions_preprocessed",
+        },
+        "contraction_events": {
+            "file_name": f"cow_{cow_id}_contraction_events.csv",
+            "phase": "Phase 3",
+            "description": "Candidate contraction peak events detected from prominence-based strain analysis and labeled using movement/flat-signal flags.",
+            "download_key": "contraction_events",
+        },
+        "contractions_10min_summary": {
+            "file_name": f"cow_{cow_id}_contractions_10min_summary.csv",
+            "phase": "Phase 3",
+            "description": "Ten-minute contraction summaries for bolus synchronization and ClockLab export.",
+            "download_key": "contractions_10min_summary",
+        },
+        "bolus_preprocessed": {
+            "file_name": f"cow_{cow_id}_bolus_preprocessed.csv",
+            "phase": "Phase 3",
+            "description": "Bolus records with corrected timestamps, temperature-for-analysis, rolling temperature, activity, and daily deviation features.",
+            "download_key": "bolus_preprocessed",
+        },
+        "merged_10min_all_bolus": {
+            "file_name": f"cow_{cow_id}_merged_10min_all_bolus.csv",
+            "phase": "Phase 3",
+            "description": "Full bolus timeline merged with contraction data where available. Includes has_contraction_data and overlap flags.",
+            "download_key": "merged_10min_all_bolus",
+        },
+        "merged_10min_overlap_only": {
+            "file_name": f"cow_{cow_id}_merged_10min_overlap_only.csv",
+            "phase": "Phase 3",
+            "description": "Only the time windows where bolus and contraction samples both exist. Best file for multimodal comparison.",
+            "download_key": "merged_10min_overlap_only",
+        },
+    }
+
+    files = []
+
+    for key, info in file_descriptions.items():
+        path = processed_folder / info["file_name"]
+        if path.exists():
+            files.append(
+                {
+                    "dataset_key": key,
+                    "file_name": info["file_name"],
+                    "phase": info["phase"],
+                    "description": info["description"],
+                    "download_key": info["download_key"],
+                    "file_path": str(path),
+                    "size_bytes": path.stat().st_size,
+                }
+            )
+
+    clocklab_folder = processed_folder / "clocklab_exports"
+
+    if clocklab_folder.exists():
+        for path in sorted(clocklab_folder.glob("*")):
+            if path.is_file() and path.suffix.lower() in {".csv", ".awd"}:
+                files.append(
+                    {
+                        "dataset_key": f"clocklab_{path.stem}",
+                        "file_name": path.name,
+                        "phase": "ClockLab Export",
+                        "description": "ClockLab-ready timestamp-value file. CSV is preserved and AWD is the ClockLab extension copy.",
+                        "download_key": None,
+                        "file_path": str(path),
+                        "size_bytes": path.stat().st_size,
+                    }
+                )
+
+    figures_folder = processed_folder / "figures"
+
+    if figures_folder.exists():
+
+        figure_descriptions = {
+            "full_clean_corrected_strain_trace": "Clean full multi-day trace of orientation-corrected strain with only the calving time marker.",
+            "daily_contraction_strain_rows": "Daily row-wise plot of 10-minute mean corrected contraction strain. Each row is one day.",
+            "actogram_candidate_peak_count": "24-hour actogram heatmap of all detected candidate peak counts per 10-minute bin.",
+            "actogram_clean_candidate_peak_count": "24-hour actogram heatmap of clean contraction-candidate peak counts after movement and bad-signal filtering.",
+            "actogram_strain_range": "24-hour actogram heatmap of corrected strain range per 10-minute bin.",
+            "actogram_movement_fraction": "24-hour actogram heatmap of movement artifact fraction per 10-minute bin.",
+            "double_actogram_candidate_peak_count": "48-hour double-plotted actogram of candidate peak count.",
+            "daily_motion_sensor_rows": "Daily row-wise accelerometer and gyroscope magnitude plots derived from Acc.X/Y/Z and G.X/Y/Z.",
+            "signal_correction_review": "QC plot comparing raw strain, file-centered strain, and orientation-corrected strain for selected files.",
+            "bolus_temperature_actogram": "24-hour actogram heatmap of bolus temperature for analysis.",
+            "daily_bolus_temperature_rows": "Daily row-wise bolus temperature plot.",
+            "parallel_bolus_contraction_daily": "Parallel daily rows comparing bolus temperature and 10-minute contraction strain with calving marker.",
+        }
+
+        for path in sorted(figures_folder.glob("*.png")):
+            description = "Generated visualization figure."
+
+            for key, value in figure_descriptions.items():
+                if key in path.stem:
+                    description = value
+                    break
+
+            files.append(
+                {
+                    "dataset_key": f"figure_{path.stem}",
+                    "file_name": path.name,
+                    "phase": "Visualization",
+                    "description": description,
+                    "download_key": None,
+                    "file_path": str(path),
+                    "size_bytes": path.stat().st_size,
+                }
+            )           
+
+    return {"cow_id": cow_id, "files": files}
+
+
 @router.get("/download/{cow_id}/{data_type}")
 def download_processed_csv(cow_id: str, data_type: str):
     file_map = {
         "contractions": f"cow_{cow_id}_contractions_processed.csv",
         "bolus": f"cow_{cow_id}_bolus_processed.csv",
+        "contractions_timing_qc": f"cow_{cow_id}_contractions_timing_qc.csv",
         "contractions_qc": f"cow_{cow_id}_contractions_qc_report.csv",
         "bolus_qc": f"cow_{cow_id}_bolus_qc_report.csv",
         "contractions_preprocessed": f"cow_{cow_id}_contractions_preprocessed.csv",
         "contraction_events": f"cow_{cow_id}_contraction_events.csv",
         "contractions_10min_summary": f"cow_{cow_id}_contractions_10min_summary.csv",
         "bolus_preprocessed": f"cow_{cow_id}_bolus_preprocessed.csv",
-        "merged_10min": f"cow_{cow_id}_merged_10min.csv",
+        "merged_10min_all_bolus": f"cow_{cow_id}_merged_10min_all_bolus.csv",
+        "merged_10min_overlap_only": f"cow_{cow_id}_merged_10min_overlap_only.csv",
     }
 
     if data_type not in file_map:
@@ -618,4 +1002,27 @@ def download_processed_csv(cow_id: str, data_type: str):
         path=file_path,
         filename=file_path.name,
         media_type="text/csv",
+    )
+
+
+@router.get("/download-clocklab/{cow_id}/{file_name}")
+def download_clocklab_file(cow_id: str, file_name: str):
+    if "/" in file_name or "\\" in file_name:
+        raise HTTPException(status_code=400, detail="Invalid file name.")
+
+    file_path = get_processed_folder(cow_id) / "clocklab_exports" / file_name
+
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="ClockLab file not found.")
+
+    media_type = (
+        "text/csv"
+        if file_path.suffix.lower() == ".csv"
+        else "application/octet-stream"
+    )
+
+    return FileResponse(
+        path=file_path,
+        filename=file_path.name,
+        media_type=media_type,
     )

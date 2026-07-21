@@ -10,22 +10,30 @@ def export_clocklab_csv_and_awd(
     output_stem: str,
     timestamp_col: str,
     value_col: str,
+    require_sample_data_col: str | None = None,
 ) -> dict:
     """
     Creates a simple ClockLab-ready CSV and an AWD copy.
 
-    The provided ClockLab instruction says to convert CSV files to .awd.
-    We use copy behavior so the CSV is preserved.
-
     Output format:
         timestamp,value
 
-    If ClockLab later requires a different column format, this function can be
-    adjusted in one place.
+    AWD is created by copying the CSV with .awd extension.
+    This preserves the CSV backup and follows the ClockLab conversion idea.
     """
     df = pd.read_csv(input_csv_path)
+
+    if timestamp_col not in df.columns:
+        raise ValueError(f"{timestamp_col} not found in {input_csv_path.name}")
+
+    if value_col not in df.columns:
+        raise ValueError(f"{value_col} not found in {input_csv_path.name}")
+
     df[timestamp_col] = pd.to_datetime(df[timestamp_col], errors="coerce")
     df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
+
+    if require_sample_data_col and require_sample_data_col in df.columns:
+        df = df[df[require_sample_data_col].astype(bool)]
 
     out = df[[timestamp_col, value_col]].dropna().copy()
     out = out.rename(columns={timestamp_col: "timestamp", value_col: "value"})
