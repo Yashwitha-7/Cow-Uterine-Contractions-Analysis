@@ -269,6 +269,29 @@ def _assign_sample_periods(metadata: pd.DataFrame) -> pd.DataFrame:
                 "default_1p8_no_full_hour_candidates"
             )
 
+    # An inherited period can make a partial file extend past the timestamp of
+    # the next file. When the two filename times define a plausible positive
+    # interval, shorten that file's inferred period so its sample boundary
+    # lands exactly on the next file start. This preserves every observation
+    # while preventing timestamps from running backwards at file boundaries.
+    for idx, row in metadata.iterrows():
+        gap_seconds = row["gap_to_next_start_seconds"]
+        if pd.isna(gap_seconds) or gap_seconds <= 0:
+            continue
+
+        row_count = int(row["row_count"])
+        assigned_period = float(metadata.at[idx, "estimated_sample_period_seconds"])
+        boundary_period = float(gap_seconds) / row_count
+
+        if (
+            row_count * assigned_period > float(gap_seconds)
+            and REASONABLE_MIN_SAMPLE_PERIOD <= boundary_period <= REASONABLE_MAX_SAMPLE_PERIOD
+        ):
+            metadata.at[idx, "estimated_sample_period_seconds"] = boundary_period
+            metadata.at[idx, "sample_period_source"] = (
+                "adjusted_to_next_file_boundary"
+            )
+
     return metadata
 
 

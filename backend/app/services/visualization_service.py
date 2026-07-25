@@ -290,8 +290,11 @@ def plot_bolus_temperature_actogram(
         cow_id=cow_id,
         values=values,
         date_labels=date_labels,
-        title=f"Cow {cow_id}: Bolus Temperature 24-hour Actogram",
-        colorbar_label="Temperature for analysis",
+        title=(
+            f"Cow {cow_id}: Drink-Cycle-Corrected Bolus Temperature "
+            "24-hour Actogram"
+        ),
+        colorbar_label="Bolus temperature (°C)",
         output_path=output_path,
         calving_time=calving_time,
     )
@@ -438,14 +441,14 @@ def plot_full_clean_corrected_strain_trace(
         plot_df["timestamp_corrected"],
         plot_df["strain_orientation_corrected"],
         linewidth=0.5,
-        label="Orientation-corrected strain",
+        label="Baseline-centered strain (no automatic polarity flip)",
     )
 
     _add_calving_marker_datetime(ax, calving_time)
 
-    ax.set_title(f"Cow {cow_id}: Full Corrected Contraction Strain Trace")
+    ax.set_title(f"Cow {cow_id}: Full Baseline-Centered Contraction Strain Trace")
     ax.set_xlabel("Time")
-    ax.set_ylabel("Orientation-corrected strain")
+    ax.set_ylabel("Baseline-centered strain")
     _format_datetime_axis(ax)
     ax.legend(loc="upper right", fontsize=8)
 
@@ -488,6 +491,7 @@ def _plot_daily_rows_from_dataframe(
         1,
         figsize=(16, fig_height),
         sharex=True,
+        sharey=True,
         squeeze=False,
     )
 
@@ -504,13 +508,21 @@ def _plot_daily_rows_from_dataframe(
 
         _add_calving_marker_to_daily_axis(ax, calving_time, date_value)
 
-        ax.set_ylabel(str(date_value), rotation=0, labelpad=45, va="center")
+        ax.text(
+            0.005,
+            0.90,
+            str(date_value),
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=8,
+        )
         ax.grid(True, alpha=0.25)
         _time_tick_setup(ax)
 
     axes[0].set_title(title)
     axes[-1].set_xlabel("Time of day")
-    fig.text(0.01, 0.5, y_label, rotation=90, va="center")
+    fig.text(0.001, 0.5, y_label, rotation=90, va="center")
 
     handles, labels = axes[0].get_legend_handles_labels()
     if handles:
@@ -545,7 +557,7 @@ def plot_daily_contraction_strain_rows(
         timestamp_col="timestamp",
         value_col="strain_mean",
         title=f"Cow {cow_id}: Daily 10-minute Contraction Strain",
-        y_label="10-minute mean corrected strain",
+        y_label="10-minute mean baseline-centered strain",
         output_path=output_path,
         calving_time=calving_time,
     )
@@ -577,8 +589,8 @@ def plot_daily_bolus_temperature_rows(
         df=bolus,
         timestamp_col="timestamp_corrected",
         value_col="temperature_for_analysis",
-        title=f"Cow {cow_id}: Daily Bolus Temperature",
-        y_label="Bolus temperature",
+        title=f"Cow {cow_id}: Daily Drink-Cycle-Corrected Bolus Temperature",
+        y_label="Bolus temperature (°C)",
         output_path=output_path,
         calving_time=calving_time,
     )
@@ -619,6 +631,7 @@ def plot_daily_motion_sensor_rows(
         2,
         figsize=(18, fig_height),
         sharex=True,
+        sharey="col",
         squeeze=False,
     )
 
@@ -634,7 +647,15 @@ def plot_daily_motion_sensor_rows(
         _add_calving_marker_to_daily_axis(ax_acc, calving_time, date_value)
         _add_calving_marker_to_daily_axis(ax_gyro, calving_time, date_value)
 
-        ax_acc.set_ylabel(str(date_value), rotation=0, labelpad=45, va="center")
+        ax_acc.text(
+            0.01,
+            0.90,
+            str(date_value),
+            transform=ax_acc.transAxes,
+            ha="left",
+            va="top",
+            fontsize=8,
+        )
 
         ax_acc.set_title("Accelerometer magnitude" if row_idx == 0 else "")
         ax_gyro.set_title("Gyroscope magnitude" if row_idx == 0 else "")
@@ -707,6 +728,7 @@ def plot_parallel_bolus_contraction_daily(
         2,
         figsize=(18, fig_height),
         sharex=True,
+        sharey="col",
         squeeze=False,
     )
 
@@ -734,10 +756,18 @@ def plot_parallel_bolus_contraction_daily(
         _add_calving_marker_to_daily_axis(ax_bolus, calving_time, date_value)
         _add_calving_marker_to_daily_axis(ax_strain, calving_time, date_value)
 
-        ax_bolus.set_ylabel(str(date_value), rotation=0, labelpad=45, va="center")
+        ax_bolus.text(
+            0.01,
+            0.90,
+            str(date_value),
+            transform=ax_bolus.transAxes,
+            ha="left",
+            va="top",
+            fontsize=8,
+        )
 
         if row_idx == 0:
-            ax_bolus.set_title("Bolus temperature")
+            ax_bolus.set_title("Drink-cycle-corrected bolus temperature (°C)")
             ax_strain.set_title("10-minute contraction strain")
 
         ax_bolus.grid(True, alpha=0.25)
@@ -846,14 +876,15 @@ def plot_signal_correction_review(
             x,
             group["strain_orientation_corrected"],
             linewidth=0.8,
-            label="Orientation-corrected strain",
+            label="Analysis strain (polarity flip not applied)",
         )
 
-        inverted = bool(group["possible_inverted_signal"].iloc[0])
+        possible_inverted = bool(group["possible_inverted_signal"].iloc[0])
         file_type = group["file_type"].iloc[0]
 
         ax.set_title(
-            f"{source_file} | inverted={inverted} | file_type={file_type}",
+            f"{source_file} | possible_inversion_flag={possible_inverted} "
+            f"(not applied) | file_type={file_type}",
             fontsize=9,
         )
         ax.grid(True, alpha=0.25)
@@ -924,7 +955,7 @@ def generate_all_visualizations(
             processed_folder=processed_folder,
             db=db,
             value_col="strain_range",
-            title_label="Corrected strain range per 10 min",
+            title_label="Baseline-centered strain range per 10 min",
             output_suffix="strain_range",
         )
     )

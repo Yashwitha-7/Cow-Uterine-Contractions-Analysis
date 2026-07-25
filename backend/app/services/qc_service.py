@@ -45,6 +45,12 @@ def create_contraction_qc_report(df: pd.DataFrame, output_path: Path) -> pd.Data
         if group["qc_warning"].dropna().astype(str).str.len().gt(0).any():
             warnings.append("timestamp_or_file_gap_warning")
 
+        timestamps = pd.to_datetime(group["timestamp"], errors="coerce")
+        if timestamps.isna().any():
+            warnings.append("missing_inferred_timestamp")
+        if (timestamps.diff().dt.total_seconds().dropna() <= 0).any():
+            warnings.append("non_increasing_timestamp")
+
         rows.append(
             {
                 "source_file": source_file,

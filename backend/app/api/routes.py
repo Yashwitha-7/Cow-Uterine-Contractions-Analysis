@@ -394,9 +394,12 @@ async def upload_contractions(
                 "duplicate_files": duplicate_files,
             }
 
+        # Rebuild from the complete raw history. Processing only saved_paths
+        # would overwrite an existing cow dataset with the latest upload batch.
+        all_raw_paths = sorted(raw_folder.glob("*.txt"))
         df, timing_qc_df = combine_contraction_files(
             cow_id=cow_id,
-            file_paths=saved_paths,
+            file_paths=all_raw_paths,
         )
 
         processed_file = processed_folder / f"cow_{cow_id}_contractions_processed.csv"
@@ -408,6 +411,12 @@ async def upload_contractions(
         qc_file = processed_folder / f"cow_{cow_id}_contractions_qc_report.csv"
         qc_df = create_contraction_qc_report(df, qc_file)
 
+        # The CSV is a complete rebuild, so keep the database in the same state
+        # rather than appending duplicate copies of previously ingested rows.
+        db.query(ContractionRecord).filter(
+            ContractionRecord.cow_id == cow_id
+        ).delete(synchronize_session=False)
+        db.commit()
         inserted_count = insert_contraction_records(db, df)
 
         upload_batch.processed_file_path = str(processed_file)

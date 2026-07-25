@@ -10,13 +10,40 @@ def _rolling_window_samples(sample_period_seconds: float, window_seconds: float)
     return max(samples, 3)
 
 
+def _add_continuous_segment_ids(df: pd.DataFrame) -> pd.DataFrame:
+    """Split rows whenever time reverses or a real recording gap occurs."""
+    out = df.sort_values(["timestamp_corrected", "source_file", "sample_index"]).copy()
+    elapsed = out["timestamp_corrected"].diff().dt.total_seconds()
+    local_period = out["estimated_sample_period_seconds"].ffill().bfill()
+    # Normal adjacent samples should be close to one local sample period.
+    # A generous five-period limit tolerates jitter without bridging outages.
+    discontinuity = elapsed.isna() | (elapsed <= 0) | (elapsed > 5 * local_period)
+    out["continuous_segment_id"] = discontinuity.cumsum().astype(int)
+    return out
+
+
+def _rolling_by_segment(
+    df: pd.DataFrame,
+    value_column: str,
+    window_seconds: float,
+    statistic: str,
+) -> pd.Series:
+    result = pd.Series(np.nan, index=df.index, dtype=float)
+    for _, group in df.groupby("continuous_segment_id", sort=False):
+        period = float(group["estimated_sample_period_seconds"].median())
+        window = _rolling_window_samples(period, window_seconds)
+        rolling = group[value_column].rolling(window, center=True, min_periods=3)
+        result.loc[group.index] = getattr(rolling, statistic)().to_numpy()
+    return result
+
+
 def preprocess_contractions(
     cow_id: str,
     processed_csv_path: Path,
     output_path: Path,
     patch_offset_minutes: float = 0.0,
 ) -> pd.DataFrame:
-    df = pd.read_csv(processed_csv_path)
+    df = pd.read_csv(processed_csv_path, low_memory=False)
 
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     df["timestamp_raw"] = df["timestamp"]
@@ -38,6 +65,9 @@ def preprocess_contractions(
 
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(subset=["timestamp"]).copy()
+    df = _add_continuous_segment_ids(df)
 
     df["acc_magnitude"] = np.sqrt(
         df["acc_x"] ** 2 + df["acc_y"] ** 2 + df["acc_z"] ** 2
@@ -73,25 +103,19 @@ def preprocess_contractions(
     df = df.merge(orientation_df, on="source_file", how="left")
 
     df["strain_orientation_corrected"] = np.where(
-        df["possible_inverted_signal"],
-        -1 * df["strain_centered_file"],
+        False,
+        -df["strain_centered_file"],
         df["strain_centered_file"],
     )
+    # The skew-based orientation result is retained for human review, but is
+    # not automatically applied: skew alone cannot establish sensor polarity.
+    df["orientation_flip_applied"] = False
 
-    sample_period = float(df["estimated_sample_period_seconds"].dropna().median())
-
-    movement_window = _rolling_window_samples(sample_period, 30)
-    flat_window = _rolling_window_samples(sample_period, 30)
-
-    df["acc_rolling_std_30s"] = (
-        df["acc_magnitude"]
-        .rolling(movement_window, center=True, min_periods=3)
-        .std()
+    df["acc_rolling_std_30s"] = _rolling_by_segment(
+        df, "acc_magnitude", 30, "std"
     )
-    df["gyro_rolling_std_30s"] = (
-        df["gyro_magnitude"]
-        .rolling(movement_window, center=True, min_periods=3)
-        .std()
+    df["gyro_rolling_std_30s"] = _rolling_by_segment(
+        df, "gyro_magnitude", 30, "std"
     )
 
     df["movement_score"] = (
@@ -99,17 +123,22 @@ def preprocess_contractions(
         + df["gyro_rolling_std_30s"].fillna(0)
     )
 
-    movement_threshold = df["movement_score"].quantile(0.90)
+    df["movement_artifact_flag"] = df["movement_flag"].eq(5)
+    for _, group in df.groupby("continuous_segment_id", sort=False):
+        score = group["movement_score"].dropna()
+        if score.empty:
+            continue
+        median = float(score.median())
+        mad = float((score - median).abs().median())
+        # A robust absolute-within-segment rule does not force an arbitrary
+        # percentage of every recording to be labelled as movement.
+        threshold = median + max(6 * mad, 1e-9)
+        df.loc[group.index, "movement_artifact_flag"] |= (
+            df.loc[group.index, "movement_score"] > threshold
+        )
 
-    df["movement_artifact_flag"] = (
-        (df["movement_flag"] == 5)
-        | (df["movement_score"] >= movement_threshold)
-    )
-
-    df["strain_rolling_std_30s"] = (
-        df["strain"]
-        .rolling(flat_window, center=True, min_periods=3)
-        .std()
+    df["strain_rolling_std_30s"] = _rolling_by_segment(
+        df, "strain", 30, "std"
     )
 
     df["flat_signal_flag"] = df["strain_rolling_std_30s"] < 0.05
@@ -128,88 +157,70 @@ def detect_contraction_events(
     df = preprocessed_df.copy()
     df = df.sort_values("timestamp_corrected").reset_index(drop=True)
 
-    sample_period = float(df["estimated_sample_period_seconds"].dropna().median())
-
-    smooth_window = _rolling_window_samples(sample_period, 10)
-    df["strain_smooth"] = (
-        df["strain_orientation_corrected"]
-        .rolling(smooth_window, center=True, min_periods=3)
-        .median()
-    )
-
-    signal = df["strain_smooth"].fillna(0).to_numpy()
-
-    mad = np.median(np.abs(signal - np.median(signal)))
-    adaptive_prominence = max(3 * mad, 1.0)
-
-    min_distance_samples = _rolling_window_samples(sample_period, 45)
-    min_width_samples = _rolling_window_samples(sample_period, 10)
-
-    peaks, properties = find_peaks(
-        signal,
-        prominence=adaptive_prominence,
-        distance=min_distance_samples,
-        width=min_width_samples,
+    df["strain_smooth"] = _rolling_by_segment(
+        df, "strain_orientation_corrected", 10, "median"
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if len(peaks) == 0:
-        events = pd.DataFrame(
-            columns=[
-                "cow_id",
-                "event_id",
-                "peak_time",
-                "source_file",
-                "peak_amplitude",
-                "prominence",
-                "width_seconds",
-                "movement_flag_near_peak",
-                "movement_score_near_peak",
-                "flat_signal_near_peak",
-                "event_label",
-            ]
-        )
-        events.to_csv(output_path, index=False)
-        return events
-
-    widths = peak_widths(signal, peaks, rel_height=0.5)[0]
-    near_peak_samples = _rolling_window_samples(sample_period, 10)
-
     rows = []
+    event_id = 0
 
-    for event_id, peak_index in enumerate(peaks, start=1):
-        left = max(0, peak_index - near_peak_samples)
-        right = min(len(df), peak_index + near_peak_samples + 1)
-        neighborhood = df.iloc[left:right]
-
-        movement_near = bool(neighborhood["movement_artifact_flag"].any())
-        flat_near = bool(neighborhood["flat_signal_flag"].any())
-
-        if flat_near:
-            label = "bad_signal_region"
-        elif movement_near:
-            label = "movement_associated_peak"
-        else:
-            label = "candidate_contraction"
-
-        rows.append(
-            {
-                "cow_id": cow_id,
-                "event_id": event_id,
-                "peak_time": df.loc[peak_index, "timestamp_corrected"],
-                "source_file": df.loc[peak_index, "source_file"],
-                "peak_amplitude": float(df.loc[peak_index, "strain_orientation_corrected"]),
-                "prominence": float(properties["prominences"][event_id - 1]),
-                "width_seconds": float(widths[event_id - 1] * sample_period),
-                "movement_flag_near_peak": int(neighborhood["movement_flag"].eq(5).any()),
-                "movement_score_near_peak": float(neighborhood["movement_score"].max()),
-                "flat_signal_near_peak": int(flat_near),
-                "event_label": label,
-            }
+    for segment_id, group in df.groupby("continuous_segment_id", sort=False):
+        group = group.reset_index()
+        sample_period = float(group["estimated_sample_period_seconds"].median())
+        signal = group["strain_smooth"].fillna(0).to_numpy()
+        mad = np.median(np.abs(signal - np.median(signal)))
+        peaks, properties = find_peaks(
+            signal,
+            prominence=max(3 * mad, 1.0),
+            distance=_rolling_window_samples(sample_period, 45),
+            width=_rolling_window_samples(sample_period, 10),
         )
+        if len(peaks) == 0:
+            continue
+        widths = peak_widths(signal, peaks, rel_height=0.5)[0]
+        near_peak_samples = _rolling_window_samples(sample_period, 10)
 
-    events = pd.DataFrame(rows)
+        for position, peak_index in enumerate(peaks):
+            event_id += 1
+            left = max(0, peak_index - near_peak_samples)
+            right = min(len(group), peak_index + near_peak_samples + 1)
+            neighborhood = group.iloc[left:right]
+
+            movement_near = bool(neighborhood["movement_artifact_flag"].any())
+            flat_near = bool(neighborhood["flat_signal_flag"].any())
+            if flat_near:
+                label = "bad_signal_region"
+            elif movement_near:
+                label = "movement_associated_peak"
+            else:
+                label = "candidate_contraction"
+
+            rows.append(
+                {
+                    "cow_id": cow_id,
+                    "event_id": event_id,
+                    "continuous_segment_id": int(segment_id),
+                    "peak_time": group.loc[peak_index, "timestamp_corrected"],
+                    "source_file": group.loc[peak_index, "source_file"],
+                    "peak_amplitude": float(group.loc[peak_index, "strain_orientation_corrected"]),
+                    "prominence": float(properties["prominences"][position]),
+                    "width_seconds": float(widths[position] * sample_period),
+                    "movement_flag_near_peak": int(neighborhood["movement_flag"].eq(5).any()),
+                    "movement_score_near_peak": float(neighborhood["movement_score"].max()),
+                    "flat_signal_near_peak": int(flat_near),
+                    "event_label": label,
+                }
+            )
+
+    event_columns = [
+        "cow_id", "event_id", "continuous_segment_id", "peak_time",
+        "source_file", "peak_amplitude", "prominence", "width_seconds",
+        "movement_flag_near_peak", "movement_score_near_peak",
+        "flat_signal_near_peak", "event_label",
+    ]
+    events = pd.DataFrame(rows, columns=event_columns)
     events.to_csv(output_path, index=False)
 
     return events
