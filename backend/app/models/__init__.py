@@ -3,6 +3,9 @@ from app.models.upload import UploadBatch
 from app.models.contraction import ContractionRecord
 from app.models.bolus import BolusRecord
 from app.models.qc import QCLog
+from app.models.file_record import FileRecord
+from app.models.processed_dataset import ProcessedDataset
+from app.models.contraction_event import ContractionEvent
 
 __all__ = [
     "Cow",
@@ -10,4 +13,7 @@ __all__ = [
     "ContractionRecord",
     "BolusRecord",
     "QCLog",
+    "FileRecord",
+    "ProcessedDataset",
+    "ContractionEvent",
 ]

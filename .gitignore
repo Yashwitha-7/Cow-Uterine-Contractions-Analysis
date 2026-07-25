@@ -23,3 +23,15 @@ data/database/
 # OS / IDE
 .DS_Store
 .vscode/
+
+data/raw/
+data/processed/
+data/database/
+data/database_backups/
+*.db
+*.sqlite
+*.xlsx
+*.csv
+*.txt
+*.awd
+.DS_Store
