@@ -14,19 +14,6 @@ dist/
 data/raw/
 data/processed/
 data/database/
-*.db
-*.sqlite
-*.xlsx
-*.csv
-*.txt
-
-# OS / IDE
-.DS_Store
-.vscode/
-
-data/raw/
-data/processed/
-data/database/
 data/database_backups/
 *.db
 *.sqlite
@@ -34,4 +21,7 @@ data/database_backups/
 *.csv
 *.txt
 *.awd
+
+# OS / IDE
 .DS_Store
+.vscode/

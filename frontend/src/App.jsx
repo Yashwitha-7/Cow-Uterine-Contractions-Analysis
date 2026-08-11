@@ -1,6 +1,7 @@
 import { useState } from "react";
 import {
   DatabaseOutlined,
+  BarChartOutlined,
   DownloadOutlined,
   ExperimentOutlined,
   FileSearchOutlined,
@@ -13,7 +14,6 @@ import {
 } from "@ant-design/icons";
 import { Layout, Menu, Typography } from "antd";
 
-import { BarChartOutlined } from "@ant-design/icons";
 import VisualAnalysisPage from "./pages/VisualAnalysisPage";
 import UploadPage from "./pages/UploadPage";
 import CowListPage from "./pages/CowListPage";
@@ -36,9 +36,9 @@ const MENU_ITEMS = [
     label: "Polarity Review",
   },
   {
-  key: "visual",
-  icon: <BarChartOutlined />,
-  label: "Visual Analysis",
+    key: "visual",
+    icon: <BarChartOutlined />,
+    label: "Visual Analysis",
   },
   {
     key: "upload",
