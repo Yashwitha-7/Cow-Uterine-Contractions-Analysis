@@ -9,6 +9,7 @@ import {
   LineChartOutlined,
   UploadOutlined,
   WarningOutlined,
+  SwapOutlined,
 } from "@ant-design/icons";
 import { Layout, Menu, Typography } from "antd";
 
@@ -22,11 +23,18 @@ import DataPreviewPage from "./pages/DataPreviewPage";
 import Phase3ProcessingPage from "./pages/Phase3ProcessingPage";
 import ClockLabExportPage from "./pages/ClockLabExportPage";
 import DownloadsPage from "./pages/DownloadsPage";
+import PolarityReviewPage from "./pages/PolarityReviewPage";
+import "./index.css";
 
 const { Header, Sider, Content } = Layout;
 const { Title, Text } = Typography;
 
 const MENU_ITEMS = [
+  {
+    key: "polarity",
+    icon: <SwapOutlined />,
+    label: "Polarity Review",
+  },
   {
   key: "visual",
   icon: <BarChartOutlined />,
@@ -90,6 +98,8 @@ function renderPage(selectedKey) {
       return <DataPreviewPage />;
     case "phase3":
       return <Phase3ProcessingPage />;
+    case "polarity":
+      return <PolarityReviewPage />;
     case "clocklab":
       return <ClockLabExportPage />;
     case "downloads":
@@ -103,13 +113,16 @@ export default function App() {
   const [selectedKey, setSelectedKey] = useState("upload");
 
   return (
-    <Layout style={{ minHeight: "100vh" }}>
-      <Sider width={260} theme="light">
-        <div style={{ padding: 20, borderBottom: "1px solid #f0f0f0" }}>
+    <Layout className="app-shell">
+      <Sider width={250} theme="light" className="cow-sidebar">
+        <div className="brand-block">
+          <div className="lab-mark" aria-hidden="true">HL</div>
+          <div>
           <Title level={4} style={{ margin: 0 }}>
-            Hoffmann Lab
+            Cow Contractions
           </Title>
-          <Text type="secondary">Cow Uterine Contraction Analysis</Text>
+          <Text type="secondary">Hoffmann Lab monitoring</Text>
+          </div>
         </div>
 
         <Menu
@@ -117,27 +130,19 @@ export default function App() {
           selectedKeys={[selectedKey]}
           items={MENU_ITEMS}
           onClick={(item) => setSelectedKey(item.key)}
-          style={{ borderRight: 0 }}
+          className="cow-menu"
         />
       </Sider>
 
       <Layout>
-        <Header
-          style={{
-            background: "#ffffff",
-            borderBottom: "1px solid #f0f0f0",
-            display: "flex",
-            alignItems: "center",
-            paddingLeft: 24,
-          }}
-        >
+        <Header className="app-header">
           <DatabaseOutlined style={{ fontSize: 22, marginRight: 12 }} />
           <Title level={4} style={{ margin: 0 }}>
-            Local Data Processing Dashboard
+            Research Analysis Dashboard
           </Title>
         </Header>
 
-        <Content style={{ padding: 24, background: "#f5f7f6" }}>
+        <Content className="app-content">
           {renderPage(selectedKey)}
         </Content>
       </Layout>

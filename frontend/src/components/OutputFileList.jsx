@@ -18,6 +18,8 @@ export default function OutputFileList({ cowId, files = [] }) {
           "Phase 3": "blue",
           "ClockLab Export": "purple",
           Visualization: "cyan",
+          "Quality Control": "gold",
+          Statistics: "volcano",
         };
 
         return <Tag color={colorMap[value] || "default"}>{value}</Tag>;
@@ -58,6 +60,9 @@ export default function OutputFileList({ cowId, files = [] }) {
           href = buildDownloadUrl(
             `/download-figure/${cowId}/${encodeURIComponent(record.file_name)}`
           );
+        } else if (["Quality Control", "Statistics"].includes(record.phase)) {
+          const category = record.phase === "Statistics" ? "statistics" : "quality_control";
+          href = buildDownloadUrl(`/download-result/${cowId}/${category}/${encodeURIComponent(record.file_name)}`);
         }
 
         if (!href) {

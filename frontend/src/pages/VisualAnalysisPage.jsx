@@ -16,7 +16,7 @@ import { apiClient, buildDownloadUrl } from "../api/client";
 import PageIntro from "../components/PageIntro";
 import OutputFileList from "../components/OutputFileList";
 
-const { Paragraph, Text, Title } = Typography;
+const { Paragraph, Text } = Typography;
 
 export default function VisualAnalysisPage() {
   const [loading, setLoading] = useState(false);

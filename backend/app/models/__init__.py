@@ -6,6 +6,7 @@ from app.models.qc import QCLog
 from app.models.file_record import FileRecord
 from app.models.processed_dataset import ProcessedDataset
 from app.models.contraction_event import ContractionEvent
+from app.models.polarity_review import PolarityReview
 
 __all__ = [
     "Cow",
@@ -16,4 +17,5 @@ __all__ = [
     "FileRecord",
     "ProcessedDataset",
     "ContractionEvent",
+    "PolarityReview",
 ]

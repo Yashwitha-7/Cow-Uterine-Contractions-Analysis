@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -17,6 +17,7 @@ from app.models.contraction_event import ContractionEvent
 from app.models.cow import Cow
 from app.models.file_record import FileRecord
 from app.models.processed_dataset import ProcessedDataset
+from app.models.polarity_review import PolarityReview
 from app.models.qc import QCLog
 from app.models.upload import UploadBatch
 from app.services.bolus_ingest import read_bolus_excel
@@ -31,10 +32,44 @@ from app.services.phase3_processing import (
     preprocess_bolus,
     preprocess_contractions,
 )
+from app.services.polarity_review import (
+    VALID_DECISIONS,
+    apply_reviewed_polarity,
+    downsample_signal,
+    find_review_sections,
+    write_review_manifest,
+)
 from app.services.qc_service import create_bolus_qc_report, create_contraction_qc_report
 from app.services.storage import get_processed_folder, get_raw_folder, save_upload_file
+from app.services.statistical_analysis import generate_statistics
 
 router = APIRouter()
+
+
+def _preprocessed_review_path(cow_id: str) -> Path:
+    return get_processed_folder(cow_id) / "quality_control" / f"cow_{cow_id}_polarity_screening.csv"
+
+
+def _serialize_review(review: PolarityReview) -> dict:
+    return {
+        "id": review.id,
+        "section_key": review.section_key,
+        "continuous_segment_id": review.continuous_segment_id,
+        "start_time": review.start_time.isoformat(),
+        "end_time": review.end_time.isoformat(),
+        "first_source_file": review.first_source_file,
+        "last_source_file": review.last_source_file,
+        "reason": review.reason,
+        "status": review.status,
+        "note": review.note,
+        "reviewed_at": review.reviewed_at.isoformat() if review.reviewed_at else None,
+    }
+
+
+def _save_review_decisions(cow_id: str, reviews: list[PolarityReview]) -> None:
+    path = get_processed_folder(cow_id) / "quality_control" / f"cow_{cow_id}_polarity_decisions.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([_serialize_review(review) for review in reviews]).to_csv(path, index=False)
 
 
 def parse_optional_datetime(value: str | None):
@@ -256,6 +291,15 @@ def preview_processed_data(
 @router.post("/visualizations/{cow_id}")
 def generate_visualizations(cow_id: str, db: Session = Depends(get_db)):
     processed_folder = get_processed_folder(cow_id)
+    pending_reviews = db.query(PolarityReview).filter(
+        PolarityReview.cow_id == cow_id,
+        PolarityReview.status == "pending",
+    ).count()
+    if pending_reviews:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Visual analysis is waiting for {pending_reviews} polarity review decision(s).",
+        )
 
     if not processed_folder.exists():
         raise HTTPException(
@@ -303,6 +347,17 @@ def download_figure(cow_id: str, file_name: str):
         filename=file_path.name,
         media_type="image/png",
     )
+
+
+@router.get("/download-result/{cow_id}/{category}/{file_name}")
+def download_result(cow_id: str, category: str, file_name: str):
+    if category not in {"quality_control", "statistics"} or "/" in file_name or "\\" in file_name:
+        raise HTTPException(status_code=400, detail="Invalid result path.")
+    file_path = get_processed_folder(cow_id) / category / file_name
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Result file not found.")
+    media_type = "application/json" if file_path.suffix.lower() == ".json" else "text/csv"
+    return FileResponse(path=file_path, filename=file_path.name, media_type=media_type)
 
 
 @router.post("/upload/contractions")
@@ -619,6 +674,140 @@ async def upload_bolus(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@router.post("/polarity/{cow_id}/prepare")
+def prepare_polarity_review(
+    cow_id: str,
+    patch_offset_minutes: float = 0.0,
+    db: Session = Depends(get_db),
+):
+    processed_folder = get_processed_folder(cow_id)
+    source = processed_folder / f"cow_{cow_id}_contractions_processed.csv"
+    if not source.exists():
+        raise HTTPException(status_code=404, detail="Contraction processed CSV not found.")
+
+    screening_path = _preprocessed_review_path(cow_id)
+    screened = preprocess_contractions(
+        cow_id=cow_id,
+        processed_csv_path=source,
+        output_path=screening_path,
+        patch_offset_minutes=patch_offset_minutes,
+    )
+    sections = find_review_sections(screened)
+    manifest = processed_folder / "quality_control" / f"cow_{cow_id}_polarity_review_manifest.csv"
+    write_review_manifest(sections, manifest)
+
+    existing_reviews = db.query(PolarityReview).filter(PolarityReview.cow_id == cow_id).all()
+    reviewed = [review for review in existing_reviews if review.status != "pending"]
+    if reviewed:
+        archive_name = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        archive_path = processed_folder / "quality_control" / f"cow_{cow_id}_polarity_decisions_before_rescreen_{archive_name}.csv"
+        pd.DataFrame([_serialize_review(review) for review in existing_reviews]).to_csv(archive_path, index=False)
+
+    valid_keys = set(sections["section_key"].tolist())
+    for review in existing_reviews:
+        if review.section_key not in valid_keys:
+            db.delete(review)
+    for row in sections.to_dict(orient="records"):
+        existing = db.query(PolarityReview).filter_by(
+            cow_id=cow_id, section_key=row["section_key"]
+        ).first()
+        if existing is None:
+            db.add(PolarityReview(cow_id=cow_id, **row))
+    db.commit()
+    reviews = db.query(PolarityReview).filter(PolarityReview.cow_id == cow_id).all()
+    return {
+        "message": "Polarity screening completed.",
+        "cow_id": cow_id,
+        "flagged_section_count": len(reviews),
+        "pending_count": sum(review.status == "pending" for review in reviews),
+        "analysis_ready": all(review.status in VALID_DECISIONS for review in reviews),
+    }
+
+
+@router.get("/polarity/{cow_id}")
+def list_polarity_reviews(cow_id: str, db: Session = Depends(get_db)):
+    reviews = (
+        db.query(PolarityReview)
+        .filter(PolarityReview.cow_id == cow_id)
+        .order_by(PolarityReview.start_time)
+        .all()
+    )
+    return {
+        "cow_id": cow_id,
+        "reviews": [_serialize_review(review) for review in reviews],
+        "pending_count": sum(review.status == "pending" for review in reviews),
+        "analysis_ready": all(review.status in VALID_DECISIONS for review in reviews),
+    }
+
+
+@router.get("/polarity/{cow_id}/{review_id}/signal")
+def polarity_review_signal(cow_id: str, review_id: int, db: Session = Depends(get_db)):
+    review = db.get(PolarityReview, review_id)
+    if review is None or review.cow_id != cow_id:
+        raise HTTPException(status_code=404, detail="Polarity review section not found.")
+    path = _preprocessed_review_path(cow_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Run polarity screening first.")
+    data = pd.read_csv(path, low_memory=False)
+    data["timestamp_corrected"] = pd.to_datetime(data["timestamp_corrected"])
+    start = review.start_time - timedelta(minutes=30)
+    end = review.end_time + timedelta(minutes=30)
+    context = data[data["timestamp_corrected"].between(start, end)].copy()
+    context["strain_orientation_corrected"] = context["strain_centered_file"]
+    return {
+        "review": _serialize_review(review),
+        "context_start": start.isoformat(),
+        "context_end": end.isoformat(),
+        "points": downsample_signal(context),
+    }
+
+
+@router.post("/polarity/{cow_id}/{review_id}/decision")
+def save_polarity_decision(
+    cow_id: str,
+    review_id: int,
+    decision: str = Query(...),
+    note: str | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    normalized = decision.lower().strip()
+    if normalized not in VALID_DECISIONS:
+        raise HTTPException(status_code=400, detail="Decision must be keep, flip, or uncertain.")
+    review = db.get(PolarityReview, review_id)
+    if review is None or review.cow_id != cow_id:
+        raise HTTPException(status_code=404, detail="Polarity review section not found.")
+    review.status = normalized
+    review.note = note
+    review.reviewed_at = datetime.utcnow()
+    db.commit()
+    all_reviews = db.query(PolarityReview).filter(PolarityReview.cow_id == cow_id).all()
+    _save_review_decisions(cow_id, all_reviews)
+    return {"message": "Polarity decision saved.", "review": _serialize_review(review)}
+
+
+@router.get("/signals/{cow_id}/hours")
+def list_signal_hours(cow_id: str):
+    path = _preprocessed_review_path(cow_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Run polarity screening first.")
+    data = pd.read_csv(path, usecols=["timestamp_corrected"])
+    timestamps = pd.to_datetime(data["timestamp_corrected"], errors="coerce").dropna()
+    hours = timestamps.dt.floor("h").drop_duplicates().sort_values()
+    return {"cow_id": cow_id, "hours": [value.isoformat() for value in hours]}
+
+
+@router.get("/signals/{cow_id}/hour")
+def get_signal_hour(cow_id: str, start: datetime = Query(...)):
+    path = _preprocessed_review_path(cow_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Run polarity screening first.")
+    data = pd.read_csv(path, low_memory=False)
+    data["timestamp_corrected"] = pd.to_datetime(data["timestamp_corrected"])
+    selected = data[data["timestamp_corrected"].between(start, start + timedelta(hours=1), inclusive="left")].copy()
+    selected["strain_orientation_corrected"] = selected["strain_centered_file"]
+    return {"cow_id": cow_id, "start": start.isoformat(), "points": downsample_signal(selected, 3000)}
+
+
 @router.post("/process/phase3/{cow_id}")
 def run_phase3_processing(
     cow_id: str,
@@ -637,18 +826,28 @@ def run_phase3_processing(
             detail="Contraction processed CSV not found.",
         )
 
+    reviews = db.query(PolarityReview).filter(PolarityReview.cow_id == cow_id).all()
+    if not _preprocessed_review_path(cow_id).exists():
+        raise HTTPException(status_code=409, detail="Run polarity screening before analysis.")
+    pending = [review for review in reviews if review.status == "pending"]
+    if pending:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Analysis is waiting for {len(pending)} polarity review decision(s).",
+        )
+
     contractions_preprocessed_path = (
         processed_folder / f"cow_{cow_id}_contractions_preprocessed.csv"
     )
     events_path = processed_folder / f"cow_{cow_id}_contraction_events.csv"
     summary_path = processed_folder / f"cow_{cow_id}_contractions_10min_summary.csv"
 
-    preprocessed_df = preprocess_contractions(
-        cow_id=cow_id,
-        processed_csv_path=contraction_csv,
-        output_path=contractions_preprocessed_path,
-        patch_offset_minutes=patch_offset_minutes,
+    preprocessed_df = pd.read_csv(_preprocessed_review_path(cow_id), low_memory=False)
+    preprocessed_df = apply_reviewed_polarity(
+        preprocessed_df,
+        [_serialize_review(review) for review in reviews],
     )
+    preprocessed_df.to_csv(contractions_preprocessed_path, index=False)
 
     events_df = detect_contraction_events(
         cow_id=cow_id,
@@ -668,6 +867,16 @@ def run_phase3_processing(
         "contraction_events": str(events_path),
         "contractions_10min_summary": str(summary_path),
     }
+
+    db.query(ContractionEvent).filter(ContractionEvent.cow_id == cow_id).delete()
+    db.query(ProcessedDataset).filter(
+        ProcessedDataset.cow_id == cow_id,
+        ProcessedDataset.dataset_type.in_([
+            "contractions_preprocessed", "contraction_events",
+            "contractions_10min_summary", "bolus_preprocessed",
+            "merged_10min_all_bolus", "merged_10min_overlap_only",
+        ]),
+    ).delete(synchronize_session=False)
 
     db.add(
         ProcessedDataset(
@@ -709,6 +918,7 @@ def run_phase3_processing(
             )
         )
 
+    bolus_df = None
     if bolus_csv.exists():
         bolus_preprocessed_path = processed_folder / f"cow_{cow_id}_bolus_preprocessed.csv"
         merged_all_path = processed_folder / f"cow_{cow_id}_merged_10min_all_bolus.csv"
@@ -760,11 +970,23 @@ def run_phase3_processing(
 
     db.commit()
 
+    statistics = generate_statistics(
+        cow_id=cow_id,
+        processed_folder=processed_folder,
+        summary=summary_df,
+        events=events_df,
+        bolus=bolus_df,
+    )
+    figures = generate_all_visualizations(cow_id, processed_folder, db)
+    outputs["statistics"] = [str(path) for path in statistics]
+    outputs["figures"] = figures
+
     return {
-        "message": "Phase 3 preprocessing completed.",
+        "message": "Reviewed analysis, statistics, and figures completed.",
         "cow_id": cow_id,
         "outputs": outputs,
         "candidate_event_count": len(events_df),
+        "figure_count": len(figures),
     }
 
 
@@ -977,8 +1199,23 @@ def list_generated_files(cow_id: str):
                     "download_key": None,
                     "file_path": str(path),
                     "size_bytes": path.stat().st_size,
-                }
-            )           
+                    }
+                )           
+
+    for folder_name, phase in [("quality_control", "Quality Control"), ("statistics", "Statistics")]:
+        folder = processed_folder / folder_name
+        if folder.exists():
+            for path in sorted(folder.iterdir()):
+                if path.is_file() and path.suffix.lower() in {".csv", ".json"}:
+                    files.append({
+                        "dataset_key": f"{folder_name}_{path.stem}",
+                        "file_name": path.name,
+                        "phase": phase,
+                        "description": "Saved polarity review/QC result." if folder_name == "quality_control" else "Saved rhythm or day/night statistical result.",
+                        "download_key": None,
+                        "file_path": str(path),
+                        "size_bytes": path.stat().st_size,
+                    })
 
     return {"cow_id": cow_id, "files": files}
 
