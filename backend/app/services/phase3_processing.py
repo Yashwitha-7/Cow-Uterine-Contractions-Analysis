@@ -190,7 +190,13 @@ def detect_contraction_events(
 
             movement_near = bool(neighborhood["movement_artifact_flag"].any())
             flat_near = bool(neighborhood["flat_signal_flag"].any())
-            if flat_near:
+            uncertain_polarity = bool(
+                "polarity_review_status" in neighborhood
+                and neighborhood["polarity_review_status"].eq("uncertain").any()
+            )
+            if uncertain_polarity:
+                label = "uncertain_polarity_region"
+            elif flat_near:
                 label = "bad_signal_region"
             elif movement_near:
                 label = "movement_associated_peak"

@@ -11,6 +11,7 @@ export default function Phase3ProcessingPage() {
   const [result, setResult] = useState(null);
   const [files, setFiles] = useState([]);
   const [cowId, setCowId] = useState("");
+  const [error, setError] = useState(null);
 
   const loadFiles = async (id) => {
     const response = await apiClient.get(`/files/${id}`);
@@ -20,6 +21,7 @@ export default function Phase3ProcessingPage() {
   const onFinish = async (values) => {
     setLoading(true);
     setCowId(values.cow_id);
+    setError(null);
 
     try {
       const response = await apiClient.post(`/process/phase3/${values.cow_id}`, null, {
@@ -31,6 +33,8 @@ export default function Phase3ProcessingPage() {
 
       setResult(response.data);
       await loadFiles(values.cow_id);
+    } catch (requestError) {
+      setError(requestError.response?.data?.detail || "Analysis could not be completed.");
     } finally {
       setLoading(false);
     }
@@ -40,13 +44,13 @@ export default function Phase3ProcessingPage() {
     <>
       <PageIntro
         title="Phase 3 Processing"
-        subtitle="This page runs the signal preprocessing and candidate contraction event pipeline."
+        subtitle="Final analysis runs only after every flagged polarity section has been reviewed."
         bullets={[
-          "Creates baseline-corrected strain and orientation-corrected strain.",
+          "Applies your saved keep, flip, or uncertain decisions without modifying raw data.",
           "Computes acceleration magnitude, gyroscope magnitude, and movement artifact score.",
           "Detects candidate contraction peaks using prominence-based peak detection.",
           "Creates 10-minute summaries for bolus synchronization.",
-          "If bolus data exists, creates all-bolus and overlap-only merged files.",
+          "Regenerates statistics, bolus heatmaps, actograms, signal figures, and synchronized files.",
         ]}
       />
 
@@ -54,8 +58,8 @@ export default function Phase3ProcessingPage() {
         type="warning"
         showIcon
         style={{ marginBottom: 16 }}
-        message="Candidate events are not confirmed contractions."
-        description="They are algorithmically detected strain peaks labeled using movement and flat-signal checks. Manual review is still required."
+        message="Polarity approval is required before this step."
+        description="Use Polarity Review first. The backend will keep this analysis locked while any detected section is pending. Candidate events remain exploratory, not confirmed contractions."
       />
 
       <Card title="Run Phase 3" style={{ marginBottom: 16 }}>
@@ -90,7 +94,7 @@ export default function Phase3ProcessingPage() {
           </Form.Item>
 
           <Button type="primary" htmlType="submit" loading={loading}>
-            Run Phase 3 Processing
+            Run Reviewed Analysis
           </Button>
         </Form>
       </Card>
@@ -104,6 +108,7 @@ export default function Phase3ProcessingPage() {
           description={`Candidate event count: ${result.candidate_event_count}`}
         />
       )}
+      {error && <Alert type="error" showIcon style={{ marginBottom: 16 }} message="Analysis is not ready" description={error} />}
 
       {files.length > 0 && <OutputFileList cowId={cowId} files={files} />}
     </>

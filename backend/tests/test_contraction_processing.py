@@ -5,6 +5,7 @@ import pandas as pd
 
 from app.services.contraction_ingest import combine_contraction_files
 from app.services.phase3_processing import preprocess_contractions
+from app.services.polarity_review import apply_reviewed_polarity, find_review_sections
 
 
 def _write_sensor_file(path: Path, rows: int) -> None:
@@ -64,3 +65,24 @@ def test_preprocessing_does_not_bridge_recording_gaps_or_auto_flip(tmp_path):
         result["strain_orientation_corrected"],
         result["strain_centered_file"],
     )
+
+
+def test_polarity_review_groups_adjacent_flagged_files_and_applies_decision():
+    timestamps = pd.date_range("2026-01-01", periods=12, freq="10min")
+    data = pd.DataFrame({
+        "continuous_segment_id": [1] * 12,
+        "source_file": ["a.txt"] * 4 + ["b.txt"] * 4 + ["c.txt"] * 4,
+        "file_order": [0] * 4 + [1] * 4 + [2] * 4,
+        "timestamp_corrected": timestamps,
+        "possible_inverted_signal": [False] * 4 + [True] * 8,
+        "strain_centered_file": np.arange(12, dtype=float),
+    })
+    sections = find_review_sections(data)
+    assert len(sections) == 1
+    assert sections.iloc[0]["first_source_file"] == "b.txt"
+    assert sections.iloc[0]["last_source_file"] == "c.txt"
+
+    review = sections.iloc[0].to_dict() | {"status": "flip"}
+    corrected = apply_reviewed_polarity(data, [review])
+    assert corrected.loc[4:, "polarity_multiplier"].eq(-1).all()
+    assert corrected.loc[:3, "polarity_multiplier"].eq(1).all()

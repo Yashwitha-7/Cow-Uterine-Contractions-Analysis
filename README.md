@@ -1,38 +1,62 @@
-# Hoffmann Lab Cow Monitoring Data Portal
+# Hoffmann Lab Cow Contraction Analysis
 
-This project supports ingestion and storage of cow uterine contraction sensor data and bolus physiological data for the Hoffmann Lab uterine contraction analysis project.
+Local research application for ingesting cow contraction sensor and bolus data, reviewing suspected strain polarity reversals, and producing quality-controlled exploratory analyses.
 
-## Phase 1 Scope
+## Analysis workflow
 
-Phase 1 performs data ingestion and storage only:
+1. Upload contraction TXT files and optional bolus Excel data.
+2. Review ingestion and timestamp QC.
+3. Open **Polarity Review** and screen the cow.
+4. Review every flagged continuous section as **Keep**, **Flip**, or **Uncertain**.
+5. Use the hourly browser to inspect every recording hour manually.
+6. Run **Reviewed Analysis** only after all flagged sections have decisions.
+7. View or download regenerated figures and statistical results.
 
-- Upload contraction TXT files by cow ID
-- Upload bolus Excel files by cow ID
-- Store raw files separately
-- Create standardized processed CSV files
-- Store processed rows in SQLite
-- Download processed CSV files
+Candidate strain peaks are exploratory and are not confirmed physiological contractions.
 
-No signal correction, contraction detection, synchronization, or modeling is performed in Phase 1.
+## Data organization
 
-## Tech Stack
+```text
+data/
+  raw/cow_<id>/
+    contractions/       immutable uploaded TXT files
+    bolus/              immutable uploaded bolus files
+  processed/cow_<id>/
+    quality_control/    polarity screening, manifest, and saved decisions
+    statistics/         day/night and 24-hour rhythm summaries
+    figures/            regenerated PNG visualizations
+    clocklab_exports/   ClockLab CSV/AWD exports
+    *.csv               current compatible analysis datasets
+  database/             local SQLite database
+```
 
-- Backend: Python, FastAPI
-- Database: SQLite
-- ORM: SQLAlchemy
-- Migrations: Alembic, planned
-- Data processing: pandas, numpy
-- Frontend: React + Vite
-- UI: Ant Design
-- Version control: Git
+## Run locally
 
-## Local Development
-
-### Backend
+Terminal 1:
 
 ```bash
-cd backend
-python3 -m venv .venv
+cd /Users/yashwitha/Documents/GitHub/Cow-Uterine-Contractions-Analysis/backend
 source .venv/bin/activate
-pip install -r requirements.txt
 uvicorn app.main:app --reload
+```
+
+Terminal 2:
+
+```bash
+cd /Users/yashwitha/Documents/GitHub/Cow-Uterine-Contractions-Analysis/frontend
+npm install
+npm run dev
+```
+
+Open the local address printed by Vite, normally `http://localhost:5173`.
+
+## Verification
+
+```bash
+cd /Users/yashwitha/Documents/GitHub/Cow-Uterine-Contractions-Analysis/backend
+.venv/bin/python -m pytest tests -q
+
+cd /Users/yashwitha/Documents/GitHub/Cow-Uterine-Contractions-Analysis/frontend
+npm run lint
+npm run build
+```
